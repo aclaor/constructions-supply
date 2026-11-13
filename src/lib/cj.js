@@ -80,3 +80,71 @@ export async function cjImport(env, pid, category, markup) {
     featured: false, active: true, sample: false, createdAt: Date.now(),
   };
 }
+
+/* ---------- Order forwarding and tracking ---------- */
+
+async function cjPost(env, path, body) {
+  const res = await fetch(API + path, {
+    method: 'POST', headers: { 'CJ-Access-Token': await token(env), 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.result === false) throw new Error('CJ: ' + (data?.message || res.status));
+  return data.data;
+}
+
+/**
+ * Creates the matching order at CJ for every line that came from a CJ product.
+ * By default the CJ order is created unpaid (you pay it in your CJ account).
+ * With settings.cjPayFromBalance it is paid from your CJ wallet balance straight away.
+ */
+export async function cjSubmitOrder(env, order, settings) {
+  const lines = order.lines.filter((l) => l.cjVid);
+  if (!lines.length) return { skipped: true, note: 'No CJ products in this order.' };
+  const products = lines.map((l) => ({ vid: l.cjVid, quantity: l.qty, storeLineItemId: l.id + (l.variant ? ':' + l.variant : '') }));
+  const from = settings.cjFromCountry || 'CN';
+  const a = order.address;
+
+  // Pick the shipping method: your preferred one when CJ offers it for this parcel, otherwise the cheapest.
+  const options = (await cjPost(env, 'logistic/freightCalculate', {
+    startCountryCode: from, endCountryCode: a.country, products: products.map((p) => ({ vid: p.vid, quantity: p.quantity })),
+  })) || [];
+  if (!options.length) throw new Error('CJ has no shipping method from ' + from + ' to ' + a.country + ' for these items.');
+  const preferred = options.find((o) => o.logisticName === settings.cjLogistic);
+  const pick = preferred || [...options].sort((x, y) => Number(x.logisticPrice) - Number(y.logisticPrice))[0];
+
+  const data = await cjPost(env, 'shopping/order/createOrderV2', {
+    orderNumber: order.id,
+    shippingCountryCode: a.country, shippingCountry: a.country, shippingProvince: a.state, shippingCity: a.city,
+    shippingCustomerName: order.customer.name.slice(0, 50), shippingAddress: a.line1, shippingAddress2: a.line2 || undefined,
+    shippingZip: a.zip, shippingPhone: order.customer.phone, email: order.customer.email,
+    logisticName: pick.logisticName, fromCountryCode: from,
+    payType: settings.cjPayFromBalance ? 2 : 3,
+    products,
+  });
+  const other = order.lines.length - lines.length;
+  return {
+    orderId: data?.orderId || '', status: data?.orderStatus || 'CREATED', logistic: pick.logisticName,
+    shippingCost: Math.round(Number(data?.postageAmount ?? pick.logisticPrice) * 100) || 0,
+    total: Math.round(Number(data?.orderAmount ?? data?.actualPayment) * 100) || 0,
+    paid: Boolean(settings.cjPayFromBalance), submittedAt: Date.now(),
+    note: other ? `${other} item(s) in this order are not CJ products. Order those from their supplier.` : '',
+  };
+}
+
+/** Reads the CJ order and copies status and tracking onto ours. Returns 'shipped' when tracking newly arrived. */
+export async function cjSyncOrder(env, order) {
+  if (!order.cj?.orderId) return null;
+  const d = await cjGet(env, 'shopping/order/getOrderDetail?orderId=' + encodeURIComponent(order.cj.orderId));
+  if (!d) return null;
+  let change = null;
+  if (d.orderStatus && d.orderStatus !== order.cj.status) { order.cj.status = d.orderStatus; change = 'status'; }
+  if (d.trackNumber && !order.tracking) {
+    order.tracking = clean(d.trackNumber, 80);
+    order.carrier = clean(d.trackingProvider || d.logisticName, 40);
+    order.trackingUrl = /^https:\/\//.test(d.trackingUrl || '') ? clean(d.trackingUrl, 300) : '';
+    if (['paid', 'processing'].includes(order.status)) order.status = 'shipped';
+    change = 'shipped';
+  }
+  if (d.orderStatus === 'DELIVERED' && order.status === 'shipped') { order.status = 'delivered'; change = change || 'status'; }
+  return change;
+}

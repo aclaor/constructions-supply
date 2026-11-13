@@ -29,12 +29,15 @@ export async function getSettings(env) {
   const saved = (await kv(env).get('settings', 'json')) || {};
   return { ...DEFAULT_SETTINGS, ...saved, shipping: { ...DEFAULT_SETTINGS.shipping, ...(saved.shipping || {}) } };
 }
+export const getFeeds = async (env) => (await kv(env).get('feeds', 'json')) || [];
+export const saveFeeds = (env, feeds) => kv(env).put('feeds', JSON.stringify(feeds));
 export const saveSettings = (env, settings) => kv(env).put('settings', JSON.stringify(settings));
 
 const orderMeta = (o) => ({
   t: o.createdAt, total: o.totals.total, status: o.status,
   name: (o.customer.name || '').slice(0, 60), email: (o.customer.email || '').slice(0, 80),
   items: o.lines.reduce((s, l) => s + l.qty, 0),
+  cj: o.cj?.orderId ? 1 : 0, cjErr: o.cj?.error ? 1 : 0,
 });
 
 export function saveOrder(env, order, { ttl } = {}) {
@@ -67,7 +70,7 @@ export function priceCart(items, catalog, settings, country) {
     const unit = v ? v.price : p.price;
     lines.push({
       id: p.id, variant: v ? v.id : '', slug: p.slug, title: p.title, variantName: v ? v.name : '',
-      image: p.images?.[0] || '', sku: v?.sku || p.sku || '', cjPid: p.cjPid || '', cjVid: v?.cjVid || '',
+      image: p.images?.[0] || '', sku: v?.sku || p.sku || '', cjPid: p.cjPid || '', cjVid: v?.cjVid || p.cjVid || '',
       supplierUrl: p.supplierUrl || '', qty, unit, total: unit * qty,
     });
   }

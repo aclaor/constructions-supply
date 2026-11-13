@@ -1,7 +1,9 @@
 import { json, htmlResponse, money, uid, hmac, safeEqual, getCookie, clean, slugify, COUNTRIES } from './lib/util.js';
-import { kv, hasKV, getCatalog, saveCatalog, getSettings, saveSettings, saveOrder, getOrder, listOrders, priceCart } from './lib/store.js';
+import { kv, hasKV, getCatalog, saveCatalog, getSettings, saveSettings, saveOrder, getOrder, listOrders, priceCart, getFeeds, saveFeeds } from './lib/store.js';
 import { paypalReady, createPaypalOrder, capturePaypalOrder } from './lib/paypal.js';
-import { cjReady, cjSearch, cjImport } from './lib/cj.js';
+import { cjReady, cjSearch, cjImport, cjSubmitOrder, cjSyncOrder } from './lib/cj.js';
+import { emailReady, sendOrderEmail, notifyOwner } from './lib/email.js';
+import { parseCsv, guessMapping, importRows, fetchFeed, MAX_ROWS } from './lib/csv.js';
 import { CATEGORIES } from './data/seed.js';
 import { artResponse } from './views/art.js';
 import * as view from './views/pages.js';
@@ -10,14 +12,76 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     try {
-      return await route(request, env, url);
+      return await route(request, env, url, ctx);
     } catch (err) {
       if (!err?.publicMessage) console.error(err?.stack || err);
       if (url.pathname.startsWith('/api/')) return json({ error: err?.publicMessage || 'Something went wrong on our side. Try again in a moment.' }, err?.status || 500);
       return htmlResponse('<h1>Something went wrong</h1><p>Reload the page to try again.</p>', 500);
     }
   },
+  // Runs on the schedule in wrangler.jsonc: pulls tracking numbers from CJ and refreshes supplier feeds.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runAutomation(env));
+  },
 };
+
+/* ---------- Automation ---------- */
+
+// After a payment clears: confirmation email, owner alert, and the order goes to CJ.
+async function afterPaid(env, orderId) {
+  const [order, settings] = await Promise.all([getOrder(env, orderId), getSettings(env)]);
+  if (!order) return;
+  let note = '';
+  if (settings.autoForwardCJ && cjReady(env) && !order.cj?.orderId) {
+    try {
+      const cj = await cjSubmitOrder(env, order, settings);
+      if (!cj.skipped) { order.cj = cj; if (order.status === 'paid') order.status = 'processing'; }
+      note = cj.skipped ? 'This order has no CJ products, so place it with your supplier by hand.'
+        : (cj.paid ? 'Sent to CJ and paid from your CJ balance.' : 'Sent to CJ. Pay for it in your CJ account so it ships.') + (cj.note ? ' ' + cj.note : '');
+    } catch (err) {
+      console.error('CJ forward failed', err);
+      order.cj = { error: String(err.message || err).slice(0, 300), failedAt: Date.now() };
+      note = 'Could not send this order to CJ automatically: ' + order.cj.error;
+    }
+    await saveOrder(env, order);
+  }
+  await Promise.all([sendOrderEmail(env, settings, order, 'confirmed'), notifyOwner(env, settings, order, note)]);
+}
+
+async function syncOneOrder(env, settings, order) {
+  const change = await cjSyncOrder(env, order);
+  if (change) await saveOrder(env, order);
+  if (change === 'shipped') await sendOrderEmail(env, settings, order, 'shipped');
+  return change;
+}
+
+async function runFeed(env, feed, catalog) {
+  const parsed = parseCsv(await fetchFeed(feed.url));
+  return importRows(catalog, parsed, feed.mapping, { ...feed.options, source: feed.id, hideMissing: true });
+}
+
+async function runAutomation(env) {
+  const settings = await getSettings(env);
+  if (cjReady(env)) {
+    const open = (await listOrders(env)).filter((o) => o.cj && ['paid', 'processing', 'shipped'].includes(o.status)).slice(0, 30);
+    for (const meta of open) {
+      try { const order = await getOrder(env, meta.id); if (order) await syncOneOrder(env, settings, order); }
+      catch (err) { console.error('CJ sync failed', meta.id, err); }
+    }
+  }
+  const feeds = await getFeeds(env);
+  const due = feeds.filter((f) => f.url && Date.now() - (f.lastRun || 0) > 20 * 3600 * 1000);
+  if (due.length) {
+    const catalog = await getCatalog(env);
+    for (const feed of due) {
+      try { feed.lastResult = await runFeed(env, feed, catalog); feed.lastError = ''; }
+      catch (err) { feed.lastError = String(err.message || err).slice(0, 200); }
+      feed.lastRun = Date.now();
+    }
+    await saveCatalog(env, catalog);
+    await saveFeeds(env, feeds);
+  }
+}
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; this.publicMessage = message; }
@@ -26,12 +90,12 @@ const body = async (request) => {
   try { return await request.json(); } catch { throw new HttpError(400, 'The request was not valid JSON.'); }
 };
 
-async function route(request, env, url) {
+async function route(request, env, url, ctx) {
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method;
   const seg = path.split('/').filter(Boolean);
 
-  if (seg[0] === 'api') return api(request, env, url, seg.slice(1));
+  if (seg[0] === 'api') return api(request, env, url, seg.slice(1), ctx);
   if (seg[0] === 'art' && seg.length === 3) return artResponse(seg[1], seg[2]);
   if (method === 'POST' && path === '/track') return track(request, env);
   if (method !== 'GET' && method !== 'HEAD') return new Response('Method not allowed', { status: 405 });
@@ -57,7 +121,7 @@ async function route(request, env, url) {
 
   const catalog = await getCatalog(env);
   if (path === '/') return htmlResponse(view.homePage({ settings, catalog }));
-  if (path === '/search') return htmlResponse(view.searchPage({ settings, catalog, q: clean(url.searchParams.get('q'), 80) }));
+  if (path === '/search') return htmlResponse(view.searchPage({ settings, catalog, q: clean(url.searchParams.get('q'), 80), url }));
   if (path === '/sitemap.xml') {
     const urls = ['/', '/collections/all', ...CATEGORIES.map((c) => '/collections/' + c.id), ...catalog.filter((p) => p.active !== false).map((p) => '/products/' + p.slug), '/pages/shipping', '/pages/returns', '/pages/contact'];
     return new Response(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map((u) => `<url><loc>${url.origin}${u}</loc></url>`).join('')}</urlset>`, { headers: { 'content-type': 'application/xml' } });
@@ -109,7 +173,7 @@ function readCheckout(b) {
   return { customer, address };
 }
 
-async function buildOrder(env, b, status) {
+async function buildOrder(env, b, status, origin) {
   const { customer, address } = readCheckout(b);
   const [catalog, settings] = await Promise.all([getCatalog(env), getSettings(env)]);
   const cart = priceCart(b.items, catalog, settings, address.country);
@@ -118,15 +182,15 @@ async function buildOrder(env, b, status) {
     id: 'LB-' + uid(8), accessKey: uid(20), status, createdAt: Date.now(), currency: settings.currency,
     customer, address, lines: cart.lines,
     totals: { subtotal: cart.subtotal, shipping: cart.shipping, tax: cart.tax, total: cart.total },
-    tracking: '', carrier: '', note: '', payment: {},
+    tracking: '', carrier: '', note: '', payment: {}, origin,
   };
   return { order, settings };
 }
 
-async function api(request, env, url, seg) {
+async function api(request, env, url, seg, ctx) {
   const method = request.method;
   const route = seg.join('/');
-  if (seg[0] === 'admin') return adminApi(request, env, url, seg.slice(1));
+  if (seg[0] === 'admin') return adminApi(request, env, url, seg.slice(1), ctx);
 
   if (route === 'cart' && method === 'POST') {
     const b = await body(request);
@@ -136,7 +200,7 @@ async function api(request, env, url, seg) {
 
   if (route === 'checkout/paypal/create' && method === 'POST') {
     if (!paypalReady(env)) throw new HttpError(503, 'Payments are not connected yet.');
-    const { order, settings } = await buildOrder(env, await body(request), 'pending_payment');
+    const { order, settings } = await buildOrder(env, await body(request), 'pending_payment', url.origin);
     try {
       order.payment = { provider: 'paypal', paypalOrderId: await createPaypalOrder(env, order, settings) };
     } catch (err) {
@@ -160,13 +224,14 @@ async function api(request, env, url, seg) {
     order.status = 'paid';
     order.payment = { ...order.payment, captureId: result.captureId, payerEmail: result.payerEmail, paidAt: Date.now() };
     await saveOrder(env, order);
+    ctx.waitUntil(afterPaid(env, order.id).catch((err) => console.error('afterPaid failed', err)));
     return done();
   }
 
   // Only available while PayPal is not connected, so the flow can be tried end to end.
   if (route === 'checkout/test' && method === 'POST') {
     if (paypalReady(env)) throw new HttpError(403, 'Test orders are turned off once payments are connected.');
-    const { order } = await buildOrder(env, await body(request), 'test');
+    const { order } = await buildOrder(env, await body(request), 'test', url.origin);
     order.payment = { provider: 'test' };
     await saveOrder(env, order, { ttl: 60 * 60 * 24 * 14 });
     return json({ redirect: `/order/${order.id}?key=${order.accessKey}&new=1` });
@@ -218,7 +283,7 @@ function readProduct(b, existing) {
   };
 }
 
-async function adminApi(request, env, url, seg) {
+async function adminApi(request, env, url, seg, ctx) {
   const method = request.method;
   const route = seg.join('/');
 
@@ -253,7 +318,8 @@ async function adminApi(request, env, url, seg) {
         toShip: orders.filter((o) => o.status === 'paid' || o.status === 'processing').length,
         products: catalog.filter((p) => p.active !== false).length, samples: catalog.filter((p) => p.sample).length,
       },
-      integrations: { paypal: paypalReady(env), paypalEnv: String(env.PAYPAL_ENV || 'live').toLowerCase(), cj: cjReady(env), storage: hasKV(env) },
+      feeds: await getFeeds(env),
+      integrations: { email: emailReady(env), paypal: paypalReady(env), paypalEnv: String(env.PAYPAL_ENV || 'live').toLowerCase(), cj: cjReady(env), storage: hasKV(env) },
     });
   }
 
@@ -265,11 +331,30 @@ async function adminApi(request, env, url, seg) {
       const b = await body(request);
       const allowed = ['paid', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded', 'test', 'pending_payment'];
       if (b.status && allowed.includes(b.status)) order.status = b.status;
+      const trackingBefore = order.tracking;
       if (b.tracking != null) order.tracking = clean(b.tracking, 80);
       if (b.carrier != null) order.carrier = clean(b.carrier, 40);
       if (b.note != null) order.note = clean(b.note, 1000);
-      if (order.tracking && order.status === 'paid') order.status = 'shipped';
+      const hadTracking = Boolean(trackingBefore);
+      if (order.tracking && ['paid', 'processing'].includes(order.status)) order.status = 'shipped';
       await saveOrder(env, order);
+      if (order.tracking && !hadTracking && order.status === 'shipped') ctx.waitUntil(sendOrderEmail(env, await getSettings(env), order, 'shipped'));
+      return json({ order });
+    }
+    if (method === 'POST' && seg[2] === 'cj') {
+      if (!cjReady(env)) throw new HttpError(503, 'Add the CJ_API_KEY secret in Cloudflare first.');
+      if (order.cj?.orderId) throw new HttpError(409, 'This order was already sent to CJ.');
+      if (!['paid', 'processing'].includes(order.status)) throw new HttpError(400, 'Only paid orders can be sent to CJ.');
+      let cj;
+      try { cj = await cjSubmitOrder(env, order, await getSettings(env)); } catch (err) { throw new HttpError(502, err.message); }
+      if (cj.skipped) throw new HttpError(400, cj.note);
+      order.cj = cj; order.status = 'processing';
+      await saveOrder(env, order);
+      return json({ order });
+    }
+    if (method === 'POST' && seg[2] === 'cj-sync') {
+      if (!order.cj?.orderId) throw new HttpError(400, 'This order has not been sent to CJ.');
+      try { await syncOneOrder(env, await getSettings(env), order); } catch (err) { throw new HttpError(502, err.message); }
       return json({ order });
     }
   }
@@ -307,10 +392,69 @@ async function adminApi(request, env, url, seg) {
       announcement: clean(b.announcement, 120),
       supportEmail: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.supportEmail || '') ? clean(b.supportEmail, 120) : '',
       taxRate: Math.min(30, Math.max(0, Number(b.taxRate) || 0)),
+      autoForwardCJ: Boolean(b.autoForwardCJ), cjPayFromBalance: Boolean(b.cjPayFromBalance),
+      cjFromCountry: /^[A-Za-z]{2}$/.test(b.cjFromCountry || '') ? b.cjFromCountry.toUpperCase() : 'CN',
+      cjLogistic: clean(b.cjLogistic, 50),
       shipping: { ...current.shipping, domesticFlat: cents(sh.domesticFlat), freeOver: cents(sh.freeOver), internationalFlat: cents(sh.internationalFlat) },
     };
     await saveSettings(env, next);
     return json({ settings: next });
+  }
+
+  // Spreadsheet import: preview first (headers, guessed columns, sample rows), then run.
+  if ((route === 'import/preview' || route === 'import/run') && method === 'POST') {
+    const b = await body(request);
+    let text;
+    try { text = b.url ? await fetchFeed(clean(b.url, 600)) : String(b.csv || ''); } catch (err) { throw new HttpError(400, err.message); }
+    if (text.length > 8_000_000) throw new HttpError(413, 'That file is larger than 8 MB. Split it into smaller files.');
+    const parsed = parseCsv(text);
+    if (!parsed.headers.length || !parsed.rows.length) throw new HttpError(400, 'No rows found. The file needs a header row and at least one product row.');
+    if (route === 'import/preview') {
+      return json({ headers: parsed.headers, mapping: guessMapping(parsed.headers), sample: parsed.rows.slice(0, 4), rows: parsed.rows.length, maxRows: MAX_ROWS });
+    }
+    const mapping = {};
+    for (const f of ['title', 'sku', 'cost', 'retail', 'images', 'description', 'category', 'stock', 'brand', 'weight']) {
+      const i = parseInt(b.mapping?.[f], 10);
+      mapping[f] = Number.isInteger(i) && i >= 0 && i < parsed.headers.length ? i : -1;
+    }
+    if (mapping.title < 0) throw new HttpError(400, 'Choose which column holds the product title.');
+    if (mapping.cost < 0 && mapping.retail < 0) throw new HttpError(400, 'Choose a price column.');
+    const options = {
+      priceMode: b.options?.priceMode === 'retail' ? 'retail' : 'cost',
+      markup: Math.min(20, Math.max(1, Number(b.options?.markup) || 2)),
+      category: CATEGORIES.some((c) => c.id === b.options?.category) ? b.options.category : CATEGORIES[0].id,
+    };
+    const feeds = await getFeeds(env);
+    const supplier = clean(b.supplier, 40) || 'Supplier';
+    let feed = feeds.find((f) => f.name.toLowerCase() === supplier.toLowerCase());
+    if (!feed) { feed = { id: 'feed-' + slugify(supplier) + '-' + Date.now().toString(36).slice(-4), name: supplier }; feeds.push(feed); }
+    Object.assign(feed, { mapping, options, lastRun: Date.now(), lastError: '' });
+    if (b.url) feed.url = b.keepSynced ? clean(b.url, 600) : '';
+    else feed.url = feed.url || '';
+    const catalog = await getCatalog(env);
+    feed.lastResult = importRows(catalog, parsed, mapping, { ...options, source: feed.id, hideMissing: false });
+    await saveCatalog(env, catalog);
+    await saveFeeds(env, feeds);
+    return json({ result: feed.lastResult, feed });
+  }
+  if (seg[0] === 'feeds' && seg[1]) {
+    const feeds = await getFeeds(env);
+    const feed = feeds.find((f) => f.id === seg[1]);
+    if (!feed) throw new HttpError(404, 'Supplier not found.');
+    if (method === 'POST' && seg[2] === 'sync') {
+      if (!feed.url) throw new HttpError(400, 'This supplier has no feed link. Upload its file again to update.');
+      const catalog = await getCatalog(env);
+      try { feed.lastResult = await runFeed(env, feed, catalog); feed.lastError = ''; } catch (err) { throw new HttpError(502, err.message); }
+      feed.lastRun = Date.now();
+      await saveCatalog(env, catalog); await saveFeeds(env, feeds);
+      return json({ feed });
+    }
+    if (method === 'DELETE') {
+      // Removes the supplier and, when asked, every product that came from it.
+      if (url.searchParams.get('products') === '1') await saveCatalog(env, (await getCatalog(env)).filter((p) => p.source !== feed.id));
+      await saveFeeds(env, feeds.filter((f) => f.id !== feed.id));
+      return json({ ok: true });
+    }
   }
 
   if (route === 'cj/search' && method === 'GET') {

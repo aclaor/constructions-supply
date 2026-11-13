@@ -19,6 +19,8 @@ A construction supply dropshipping store that runs on one Cloudflare Worker. No 
 | `PAYPAL_CLIENT_ID` | From your PayPal app (developer.paypal.com → Apps & Credentials → Live). |
 | `PAYPAL_CLIENT_SECRET` | Same PayPal app. |
 | `CJ_API_KEY` | Optional. CJ Dropshipping → My CJ → Authorization → API. |
+| `RESEND_API_KEY` | Optional. From resend.com, to send order and shipping emails. |
+| `EMAIL_FROM` | Needed with the Resend key, e.g. `Leeys Build Supply <orders@yourdomain.com>`. The domain must be verified in Resend. |
 | `PAYPAL_ENV` | Optional. Set to `sandbox` to test with sandbox keys. Defaults to `live`. |
 
 Until the PayPal secrets are set, checkout only places clearly labelled test orders and no money moves.
@@ -30,11 +32,19 @@ Until the PayPal secrets are set, checkout only places clearly labelled test ord
 - Read the policy text in `src/data/policies.js` (shipping times, returns) and change it to match what you actually offer.
 - Departments live in `src/data/seed.js` (`CATEGORIES`).
 
-## Fulfilling an order
+## What runs by itself
 
-1. A paid order shows in `/admin` → Orders with the customer's address and each item's SKU and CJ IDs.
-2. Place the order with your supplier.
-3. Paste the tracking number into the order and save. The status changes to Shipped and the customer sees the tracking number on their order page.
+- **After a payment**: the customer gets a confirmation email, you get a new-order email (sent to the support email in Settings), and the order is created in your CJ account with the cheapest shipping method (or your preferred one).
+- **Paying CJ**: off by default, so CJ orders wait for you to pay them. Turn on "pay CJ from my CJ wallet balance" in Settings and orders ship with no action from you.
+- **Every 3 hours**: tracking numbers are pulled from CJ, the order is marked Shipped, and the customer is emailed the tracking number.
+- **Every day**: supplier files imported from a link are re-read, so prices and stock update, sold-out products are hidden and removed ones are taken down.
+
+## Importing products
+
+- **CJ Dropshipping**: `/admin` → Import products → search and import with a markup.
+- **Any other supplier (VEVOR, Inventory Source, Wholesale2B ...)**: upload their CSV file or paste its direct link, match the columns, choose a markup. Importing the same supplier again updates products instead of duplicating them. Up to 3,000 rows per file and 4,000 products in total.
+
+Orders for products that did not come from CJ are not forwarded automatically: place those with the supplier, then paste the tracking number into the order.
 
 ## Run locally
 

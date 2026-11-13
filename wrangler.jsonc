@@ -8,5 +8,7 @@
   "kv_namespaces": [{ "binding": "STORE" }],
   // Keeps variables and secrets you add in the Cloudflare dashboard across deploys.
   "keep_vars": true,
+  // Every 3 hours: pull tracking numbers from CJ and refresh supplier feeds.
+  "triggers": { "crons": ["17 */3 * * *"] },
   "observability": { "enabled": true }
 }

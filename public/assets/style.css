@@ -270,3 +270,5 @@ legend { font: 700 1.35rem/1 var(--display); padding: 0 6px; }
   .steps { grid-template-columns: 1fr 1fr; gap: 12px 0; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+.pager { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 28px; color: var(--steel); }

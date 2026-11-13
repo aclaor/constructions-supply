@@ -20,6 +20,10 @@ export const DEFAULT_SETTINGS = {
   supportEmail: '',
   currency: 'USD',
   taxRate: 0,
+  autoForwardCJ: true,
+  cjPayFromBalance: false,
+  cjFromCountry: 'CN',
+  cjLogistic: '',
   shipping: { domesticCountry: 'US', domesticFlat: 895, freeOver: 9900, internationalFlat: 2495 },
 };
 

@@ -101,6 +101,15 @@ export function productCard(p, settings) {
 </article>`;
 }
 
+const PER_PAGE = 24;
+function paginate(list, url) {
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  const cur = Math.min(pages, Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1));
+  const link = (n) => { const u = new URL(url); u.searchParams.set('page', n); return esc(u.pathname + u.search); };
+  const nav = pages > 1 ? `<nav class="pager" aria-label="Pages">${cur > 1 ? `<a class="btn" href="${link(cur - 1)}">Previous</a>` : ''}<span>Page ${cur} of ${pages}</span>${cur < pages ? `<a class="btn" href="${link(cur + 1)}">Next</a>` : ''}</nav>` : '';
+  return { items: list.slice((cur - 1) * PER_PAGE, cur * PER_PAGE), nav };
+}
+
 const grid = (products, settings) => `<div class="grid">${products.map((p) => productCard(p, settings)).join('')}</div>`;
 
 export function homePage({ settings, catalog }) {
@@ -158,6 +167,7 @@ export function collectionPage({ settings, catalog, category, url }) {
   else if (sort === 'newest') list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   else list.sort((a, b) => Number(Boolean(b.featured)) - Number(Boolean(a.featured)));
   const title = cat ? cat.name : 'All products';
+  const pg = paginate(list, url);
   const opt = (v, label) => `<option value="${v}"${sort === v ? ' selected' : ''}>${label}</option>`;
   const body = `
 <div class="wrap page-head">
@@ -169,17 +179,18 @@ export function collectionPage({ settings, catalog, category, url }) {
   <p>${list.length} ${list.length === 1 ? 'product' : 'products'}</p>
   <form method="get"><label>Sort by <select name="sort" onchange="this.form.submit()">${opt('featured', 'Featured')}${opt('price-asc', 'Price, low to high')}${opt('price-desc', 'Price, high to low')}${opt('newest', 'Newest')}</select></label><noscript><button class="btn btn-line">Apply</button></noscript></form>
 </div>
-<div class="wrap section-tight">${list.length ? grid(list, settings) : `<div class="empty"><h2>Nothing on this aisle yet</h2><p>New stock is added regularly. Browse everything we carry in the meantime.</p><a class="btn btn-primary" href="/collections/all">Browse all products</a></div>`}</div>`;
+<div class="wrap section-tight">${list.length ? grid(pg.items, settings) + pg.nav : `<div class="empty"><h2>Nothing on this aisle yet</h2><p>New stock is added regularly. Browse everything we carry in the meantime.</p><a class="btn btn-primary" href="/collections/all">Browse all products</a></div>`}</div>`;
   return layout({ settings, title, description: cat?.blurb, body, path: '/collections/' + category });
 }
 
-export function searchPage({ settings, catalog, q }) {
+export function searchPage({ settings, catalog, q, url }) {
   const terms = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
   const list = terms.length ? catalog.filter((p) => {
     if (p.active === false) return false;
     const hay = (p.title + ' ' + catName(p.category) + ' ' + (p.description || '')).toLowerCase();
     return terms.every((t) => hay.includes(t));
   }) : [];
+  const pg = paginate(list, url);
   const body = `
 <div class="wrap page-head">
   <h1>${q ? `Results for “${esc(q)}”` : 'Search'}</h1>
@@ -188,7 +199,7 @@ export function searchPage({ settings, catalog, q }) {
     <button class="btn btn-primary">Search</button>
   </form>
 </div>
-<div class="wrap section-tight">${list.length ? `<p class="count">${list.length} ${list.length === 1 ? 'product' : 'products'}</p>${grid(list, settings)}`
+<div class="wrap section-tight">${list.length ? `<p class="count">${list.length} ${list.length === 1 ? 'product' : 'products'}</p>${grid(pg.items, settings)}${pg.nav}`
     : q ? `<div class="empty"><h2>No products match “${esc(q)}”</h2><p>Try a shorter search like “drill” or “anchor”, or pick a department.</p><a class="btn btn-primary" href="/collections/all">Browse all products</a></div>` : ''}</div>`;
   return layout({ settings, title: q ? `Search: ${q}` : 'Search', body, head: '<meta name="robots" content="noindex">' });
 }
@@ -304,7 +315,7 @@ export function orderPage({ settings, order: o, fresh }) {
 <div class="wrap order">
   <div>
     ${stopped ? `<div class="notice">This order was ${esc(statusLabel(o.status).toLowerCase())}.</div>` : `<ol class="steps">${steps.map((s, i) => `<li class="${i <= reached ? 'done' : ''}${i === reached ? ' current' : ''}">${s}</li>`).join('')}</ol>`}
-    ${o.tracking ? `<div class="tracking"><h2>Tracking</h2><p>${o.carrier ? esc(o.carrier) + ' ' : ''}<b>${esc(o.tracking)}</b></p></div>` : ''}
+    ${o.tracking ? `<div class="tracking"><h2>Tracking</h2><p>${o.carrier ? esc(o.carrier) + ' ' : ''}<b>${esc(o.tracking)}</b></p>${o.trackingUrl ? `<p><a href="${esc(o.trackingUrl)}" target="_blank" rel="noopener">Track this parcel with the carrier</a></p>` : ''}</div>` : ''}
     <h2>Items</h2>
     <ul class="lines">${o.lines.map((l) => `<li><img src="${esc(l.image)}" alt="" width="64" height="64"><div><a href="/products/${esc(l.slug)}">${esc(l.title)}</a>${l.variantName ? `<small>${esc(l.variantName)}</small>` : ''}<small>Qty ${l.qty}</small></div><b>${money(l.total, cur)}</b></li>`).join('')}</ul>
   </div>

@@ -9,7 +9,8 @@
   const STATUS = { pending_payment: 'Awaiting payment', paid: 'Paid', processing: 'Being prepared', shipped: 'Shipped', delivered: 'Delivered', cancelled: 'Cancelled', refunded: 'Refunded', test: 'Test order' };
   const LOGO = '<svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="5" fill="#FFC61A"/><path d="M9 7v18h16v-5H14V7z" fill="#14212B"/></svg>';
 
-  let state = { tab: 'orders', data: null, products: [] };
+  let state = { tab: 'orders', data: null, products: [], filter: '', sheet: null };
+  const feedName = (id) => (state.data.feeds || []).find((f) => f.id === id)?.name || 'Imported';
 
   async function api(path, opts = {}) {
     const res = await fetch('/api/admin/' + path, {
@@ -62,7 +63,7 @@
   /* ---------- Shell ---------- */
   function render() {
     const d = state.data;
-    const tabs = [['orders', 'Orders'], ['products', 'Products'], ['import', 'Import from CJ'], ['settings', 'Settings']];
+    const tabs = [['orders', 'Orders'], ['products', 'Products'], ['import', 'Import products'], ['settings', 'Settings']];
     app.innerHTML = `<header class="adm-bar"><div class="wrap">
         <a class="logo" href="/admin/">${LOGO}<span>${esc(d.settings.storeName)}</span></a>
         <div class="adm-tabs" role="tablist">${tabs.map(([id, label]) => `<button role="tab" data-tab="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('')}</div>
@@ -75,7 +76,7 @@
   function ordersView() {
     const d = state.data; const s = d.stats; const i = d.integrations;
     const check = (on, yes, no) => `<div class="check"><span class="dot${on ? ' on' : ''}"></span><span>${on ? yes : no}</span></div>`;
-    const setupDone = i.paypal && i.cj && i.storage && d.settings.supportEmail && !s.samples;
+    const setupDone = i.paypal && i.cj && i.email && i.storage && d.settings.supportEmail && !s.samples;
     return `<div class="stats">
         <div class="stat"><b>${esc(s.revenue)}</b><span>Paid sales</span></div>
         <div class="stat"><b>${s.orderCount}</b><span>Paid orders</span></div>
@@ -86,36 +87,78 @@
         ${check(i.storage, 'Storage is connected.', 'Storage is not connected. Orders and edits will not be saved. Redeploy so Wrangler creates the STORE namespace.')}
         ${check(i.paypal, `PayPal is connected (${esc(i.paypalEnv)} mode).`, 'PayPal is not connected. Add the PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET secrets in Cloudflare. Checkout only places test orders until then.')}
         ${check(i.cj, 'CJ Dropshipping is connected.', 'CJ Dropshipping is not connected. Add the CJ_API_KEY secret to import products.')}
+        ${check(i.email, 'Customer emails are connected.', 'Customer emails are off. Add the RESEND_API_KEY and EMAIL_FROM secrets to send order and shipping emails.')}
         ${check(Boolean(d.settings.supportEmail), 'Support email is set.', 'Add a support email in Settings so customers can reach you.')}
         ${check(!s.samples, 'No sample products left.', `${s.samples} sample products are still live. Replace them with real products before launch.`)}
       </div></div>`}
       <div class="panel"><h2>Orders</h2>
-      ${d.orders.length ? `<div class="scroll"><table class="list"><thead><tr><th>Order</th><th>Date</th><th>Customer</th><th>Items</th><th>Total</th><th>Status</th></tr></thead><tbody>
-        ${d.orders.map((o) => `<tr data-row data-order="${esc(o.id)}" tabindex="0"><td><b>${esc(o.id)}</b></td><td>${new Date(o.t).toLocaleDateString()}</td><td>${esc(o.name)}<br><span class="muted">${esc(o.email)}</span></td><td>${o.items}</td><td>${usd(o.total)}</td><td><span class="status status-${esc(o.status)}">${esc(STATUS[o.status] || o.status)}</span></td></tr>`).join('')}
+      ${d.orders.length ? `<div class="scroll"><table class="list"><thead><tr><th>Order</th><th>Date</th><th>Customer</th><th>Items</th><th>Total</th><th>Status</th><th>Supplier</th></tr></thead><tbody>
+        ${d.orders.map((o) => `<tr data-row data-order="${esc(o.id)}" tabindex="0"><td><b>${esc(o.id)}</b></td><td>${new Date(o.t).toLocaleDateString()}</td><td>${esc(o.name)}<br><span class="muted">${esc(o.email)}</span></td><td>${o.items}</td><td>${usd(o.total)}</td><td><span class="status status-${esc(o.status)}">${esc(STATUS[o.status] || o.status)}</span></td><td>${o.cj ? 'Sent to CJ' : o.cjErr ? '<b style="color:var(--hivis)">CJ failed</b>' : '<span class="muted">Not sent</span>'}</td></tr>`).join('')}
       </tbody></table></div>` : '<p class="muted">No orders yet. They appear here as soon as a customer checks out.</p>'}</div>`;
   }
 
   function productsView() {
     const cats = Object.fromEntries(state.data.categories.map((c) => [c.id, c.name]));
     const samples = state.products.filter((p) => p.sample).length;
+    const f = (state.filter || '').toLowerCase();
+    const matches = f ? state.products.filter((p) => (p.title + ' ' + (p.sku || '')).toLowerCase().includes(f)) : state.products;
+    const shown = matches.slice(0, 150);
     return `<div class="panel"><div class="panel-head"><h2>Products (${state.products.length})</h2>
         <div class="row-actions">${samples ? `<button class="btn danger" data-remove-samples>Remove ${samples} sample products</button>` : ''}<button class="btn btn-primary" data-new-product>Add product</button></div></div>
+      ${state.products.length > 12 ? `<label class="field" style="margin-bottom:12px"><span>Find a product</span><input id="product-filter" value="${esc(state.filter || '')}" placeholder="Type part of a title or SKU"></label>` : ''}
+      ${shown.length < matches.length ? `<p class="muted">Showing the first ${shown.length} of ${matches.length}. Use the box above to narrow it down.</p>` : ''}
       ${state.products.length ? `<div class="scroll"><table class="list"><thead><tr><th></th><th>Product</th><th>Department</th><th>Price</th><th>Cost</th><th>Status</th></tr></thead><tbody>
-        ${state.products.map((p) => `<tr data-row data-product="${esc(p.id)}" tabindex="0"><td><img src="${esc(p.images?.[0] || '')}" alt=""></td><td><b>${esc(p.title)}</b>${p.sample ? '<br><span class="muted">Sample</span>' : ''}${p.cjPid ? '<br><span class="muted">From CJ</span>' : ''}</td><td>${esc(cats[p.category] || '')}</td><td>${usd(p.price)}${p.variants?.length ? ' and up' : ''}</td><td>${p.cost ? usd(p.cost) : '<span class="muted">Not set</span>'}</td><td>${p.active === false ? 'Hidden' : 'Live'}</td></tr>`).join('')}
+        ${shown.map((p) => `<tr data-row data-product="${esc(p.id)}" tabindex="0"><td><img src="${esc(p.images?.[0] || '')}" alt=""></td><td><b>${esc(p.title)}</b>${p.sample ? '<br><span class="muted">Sample</span>' : ''}${p.cjPid ? '<br><span class="muted">From CJ</span>' : ''}${p.source ? `<br><span class="muted">${esc(feedName(p.source))}</span>` : ''}</td><td>${esc(cats[p.category] || '')}</td><td>${usd(p.price)}${p.variants?.length ? ' and up' : ''}</td><td>${p.cost ? usd(p.cost) : '<span class="muted">Not set</span>'}</td><td>${p.active === false ? 'Hidden' : 'Live'}</td></tr>`).join('')}
       </tbody></table></div>` : '<p class="muted">No products yet. Add one by hand or import from CJ Dropshipping.</p>'}</div>`;
   }
 
   function importView() {
     const on = state.data.integrations.cj;
-    return `<div class="panel"><h2>Import from CJ Dropshipping</h2>
+    const feeds = state.data.feeds || [];
+    const cats = state.data.categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+    return `<div class="panel"><h2>Import a supplier spreadsheet</h2>
+      <p class="muted">Works with the product file from any supplier (VEVOR, Inventory Source, Wholesale2B and others): CSV, semicolon or tab separated. Importing the same supplier again updates prices and stock instead of adding duplicates.</p>
+      <form id="sheet-form" class="form-grid" style="margin-top:14px">
+        <label class="field"><span>Supplier name</span><input name="supplier" placeholder="VEVOR" required></label>
+        <label class="field"><span>Product file</span><input name="file" type="file" accept=".csv,.tsv,.txt,text/csv"></label>
+        <label class="field full"><span>Or a direct link to the file (https)</span><input name="url" type="url" placeholder="https://supplier.example/feed.csv"></label>
+        <div class="full row-actions"><button class="btn btn-primary">Read file</button></div>
+      </form>
+      <div id="sheet-map"></div></div>
+      ${feeds.length ? `<div class="panel"><h2>Suppliers</h2><div class="scroll"><table class="list"><thead><tr><th>Supplier</th><th>Products</th><th>Last update</th><th>Updates itself</th><th></th></tr></thead><tbody>
+        ${feeds.map((f) => `<tr><td><b>${esc(f.name)}</b>${f.lastError ? `<br><span style="color:var(--hivis)">${esc(f.lastError)}</span>` : ''}</td>
+          <td>${state.products.filter((p) => p.source === f.id).length}</td>
+          <td>${f.lastRun ? new Date(f.lastRun).toLocaleString() : ''}${f.lastResult ? `<br><span class="muted">${f.lastResult.added} added, ${f.lastResult.updated} updated, ${f.lastResult.hidden} hidden</span>` : ''}</td>
+          <td>${f.url ? 'Daily, from its link' : '<span class="muted">No, upload again to update</span>'}</td>
+          <td><div class="row-actions">${f.url ? `<button class="btn" data-feed-sync="${esc(f.id)}">Update now</button>` : ''}<button class="btn danger" data-feed-remove="${esc(f.id)}">Remove</button></div></td></tr>`).join('')}
+      </tbody></table></div></div>` : ''}
+      <div class="panel"><h2>Import from CJ Dropshipping</h2>
       ${on ? `<p class="muted">Search CJ's catalog, pick a department and a markup, and the product is added to your store with its photos, options and CJ cost.</p>
       <form id="cj-search" class="row-actions" style="margin-top:14px">
         <label class="field" style="flex:1;min-width:220px"><span>Search CJ</span><input name="q" placeholder="cordless drill, safety gloves" required></label>
-        <label class="field"><span>Add to department</span><select name="category">${state.data.categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></label>
+        <label class="field"><span>Add to department</span><select name="category">${cats}</select></label>
         <label class="field" style="width:130px"><span>Price = cost ×</span><input name="markup" type="number" step="0.1" min="1" value="2.2"></label>
         <button class="btn btn-primary" style="align-self:end">Search</button>
       </form><div id="cj-results"></div>`
-      : `<p>Add your CJ API key in Cloudflare as a secret named <b>CJ_API_KEY</b>, then reload. You can still add products by hand under Products.</p>`}</div>`;
+      : `<p>Add your CJ API key in Cloudflare as a secret named <b>CJ_API_KEY</b>, then reload.</p>`}</div>`;
+  }
+
+  const FIELDS = [['title', 'Product title', true], ['sku', 'SKU or item number'], ['cost', 'Your cost (what the supplier charges you)'], ['retail', 'Retail or list price'], ['images', 'Image link'], ['description', 'Description'], ['category', 'Supplier category (helps pick the department)'], ['stock', 'Stock quantity'], ['brand', 'Brand'], ['weight', 'Weight']];
+  function renderMapping(pre) {
+    const box = document.getElementById('sheet-map');
+    const opts = (sel) => `<option value="-1">Not in this file</option>` + pre.headers.map((h, i) => `<option value="${i}"${i === sel ? ' selected' : ''}>${esc(h || 'Column ' + (i + 1))}</option>`).join('');
+    box.innerHTML = `<form id="sheet-run" style="margin-top:22px;border-top:1px solid var(--line);padding-top:18px">
+      <h2>Match the columns</h2>
+      <p class="muted">${pre.rows} product rows found${pre.rows > pre.maxRows ? `. Only the first ${pre.maxRows} are imported per file` : ''}. We guessed the columns below. Fix any that are wrong.</p>
+      <div class="form-grid" style="margin-top:14px">
+        ${FIELDS.map(([f, label, req]) => `<label class="field"><span>${label}${req ? ' (required)' : ''}</span><select name="map-${f}">${opts(pre.mapping[f])}</select></label>`).join('')}
+        <label class="field"><span>How to set your selling price</span><select name="priceMode"><option value="cost">Your cost × markup</option><option value="retail">Use the retail price column as is</option></select></label>
+        <label class="field"><span>Markup (cost ×)</span><input name="markup" type="number" step="0.1" min="1" value="2"></label>
+        <label class="field"><span>Department when we cannot tell</span><select name="category">${state.data.categories.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></label>
+        ${state.sheet.url ? `<label class="tick"><input type="checkbox" name="keepSynced" checked> Re-read this link every day to update prices and stock</label>` : ''}
+      </div>
+      <div class="scroll" style="margin-top:14px"><table class="list"><thead><tr>${pre.headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${pre.sample.map((r) => `<tr>${pre.headers.map((_, i) => `<td>${esc(String(r[i] ?? '').slice(0, 60))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+      <div class="row-actions" style="margin-top:16px"><button class="btn btn-primary btn-lg">Import products</button></div></form>`;
   }
 
   function settingsView() {
@@ -129,7 +172,15 @@
         <label class="field"><span>Free US shipping over ($, 0 to turn off)</span><input name="freeOver" inputmode="decimal" value="${dollars(s.shipping.freeOver) || '0'}"></label>
         <label class="field"><span>International shipping, flat rate ($)</span><input name="internationalFlat" inputmode="decimal" value="${dollars(s.shipping.internationalFlat) || '0'}"></label>
         <label class="field"><span>Sales tax (%)</span><input name="taxRate" inputmode="decimal" value="${esc(s.taxRate)}"></label>
-      </div><div class="row-actions" style="margin-top:18px"><button class="btn btn-primary">Save settings</button></div></form>`;
+      </div>
+      <h2 style="margin-top:26px">Automation</h2><div class="form-grid">
+        <label class="tick full"><input type="checkbox" name="autoForwardCJ"${s.autoForwardCJ ? ' checked' : ''}> Send paid orders to CJ Dropshipping automatically</label>
+        <label class="tick full"><input type="checkbox" name="cjPayFromBalance"${s.cjPayFromBalance ? ' checked' : ''}> Also pay CJ from my CJ wallet balance, so orders ship with no action from me</label>
+        <p class="muted full">With the second box off, each order is created in your CJ account and waits for you to pay it there. With it on, CJ takes the product and shipping cost from your CJ balance as soon as a customer pays.</p>
+        <label class="field"><span>CJ ships from (country code)</span><input name="cjFromCountry" value="${esc(s.cjFromCountry || 'CN')}" maxlength="2"></label>
+        <label class="field"><span>Preferred CJ shipping method (empty = cheapest)</span><input name="cjLogistic" value="${esc(s.cjLogistic || '')}" placeholder="CJPacket Ordinary"></label>
+      </div>
+      <div class="row-actions" style="margin-top:18px"><button class="btn btn-primary">Save settings</button></div></form>`;
   }
 
   /* ---------- Order dialog ---------- */
@@ -147,6 +198,9 @@
           ${o.lines.map((l) => `<tr><td>${esc(l.title)}${l.variantName ? `<br><span class="muted">${esc(l.variantName)}</span>` : ''}</td><td>${l.qty}</td><td>${usd(l.total)}</td><td>${l.sku ? 'SKU ' + esc(l.sku) : ''}${l.cjVid ? `<br><span class="muted">CJ variant ${esc(l.cjVid)}</span>` : l.cjPid ? `<br><span class="muted">CJ product ${esc(l.cjPid)}</span>` : ''}${l.supplierUrl ? `<br><a href="${esc(l.supplierUrl)}" target="_blank" rel="noopener">Open supplier page</a>` : ''}</td></tr>`).join('')}
         </tbody></table></div>
         <p>Subtotal ${usd(o.totals.subtotal)}, shipping ${usd(o.totals.shipping)}${o.totals.tax ? ', tax ' + usd(o.totals.tax) : ''}. <b>Total ${usd(o.totals.total)}</b>${o.payment?.captureId ? `<br><span class="muted">PayPal capture ${esc(o.payment.captureId)}</span>` : ''}</p>
+        ${o.status === 'test' || o.status === 'pending_payment' ? '' : `<div class="notice" style="margin:0">${o.cj?.orderId
+          ? `<b>Sent to CJ</b> (CJ order ${esc(o.cj.orderId)}, ${esc(o.cj.status || '')}${o.cj.logistic ? ', ' + esc(o.cj.logistic) : ''}${o.cj.total ? ', ' + usd(o.cj.total) : ''}). ${o.cj.paid ? 'Paid from your CJ balance.' : 'Pay it in your CJ account so it ships.'}${o.cj.note ? ' ' + esc(o.cj.note) : ''} <button type="button" class="link-btn" data-cj-sync="${esc(o.id)}">Check CJ for tracking</button>`
+          : `${o.cj?.error ? `<b>CJ did not accept this order:</b> ${esc(o.cj.error)} ` : 'Not sent to CJ yet. '}${o.lines.some((l) => l.cjVid) ? `<button type="button" class="link-btn" data-cj-send="${esc(o.id)}">Send to CJ now</button>` : 'None of these items are CJ products, so order them from their supplier.'}`}</div>`}
         <div class="form-grid">
           <label class="field"><span>Status</span><select name="status">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}"${o.status === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>
           <label class="field"><span>Carrier</span><input name="carrier" value="${esc(o.carrier)}" placeholder="USPS, UPS, YunExpress"></label>
@@ -209,7 +263,7 @@
 
   /* ---------- Events ---------- */
   document.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-tab],[data-logout],[data-order],[data-product],[data-new-product],[data-remove-samples],[data-close],[data-cj]');
+    const t = e.target.closest('[data-tab],[data-logout],[data-order],[data-product],[data-new-product],[data-remove-samples],[data-close],[data-cj],[data-cj-send],[data-cj-sync],[data-feed-sync],[data-feed-remove]');
     if (!t) return;
     if (t.dataset.tab) { state.tab = t.dataset.tab; return render(); }
     if (t.matches('[data-close]')) return dlg.close();
@@ -222,6 +276,23 @@
       try { await api('products/samples', { method: 'DELETE' }); toast('Sample products removed'); load(); } catch (err) { fail(err); }
       return;
     }
+    if (t.dataset.cjSend || t.dataset.cjSync) {
+      const id = t.dataset.cjSend || t.dataset.cjSync;
+      t.disabled = true;
+      try { await api('orders/' + id + (t.dataset.cjSend ? '/cj' : '/cj-sync'), { method: 'POST' }); toast(t.dataset.cjSend ? 'Order sent to CJ' : 'Checked CJ'); dlg.close(); await load(); openOrder(id); }
+      catch (err) { t.disabled = false; fail(err); }
+      return;
+    }
+    if (t.dataset.feedSync) {
+      t.disabled = true; t.textContent = 'Updating…';
+      try { await api('feeds/' + t.dataset.feedSync + '/sync', { method: 'POST' }); toast('Supplier updated'); load(); } catch (err) { t.disabled = false; t.textContent = 'Update now'; fail(err); }
+      return;
+    }
+    if (t.dataset.feedRemove) {
+      if (!confirm('Remove this supplier and every product imported from it? This cannot be undone.')) return;
+      try { await api('feeds/' + t.dataset.feedRemove + '?products=1', { method: 'DELETE' }); toast('Supplier removed'); load(); } catch (err) { fail(err); }
+      return;
+    }
     if (t.dataset.cj) {
       const f = document.getElementById('cj-search');
       t.disabled = true; t.textContent = 'Importing…';
@@ -230,11 +301,35 @@
     }
   });
   document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('tr[data-row]')) e.target.click(); });
+  document.addEventListener('input', (e) => {
+    if (e.target.id !== 'product-filter') return;
+    state.filter = e.target.value; render();
+    const box = document.getElementById('product-filter'); box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+  });
   document.addEventListener('submit', async (e) => {
+    if (e.target.id === 'sheet-form') {
+      e.preventDefault(); const f = e.target;
+      const file = f.file.files[0]; const url = f.url.value.trim();
+      if (!file && !url) return toast('Choose a file or paste a link first.');
+      try {
+        state.sheet = { supplier: f.supplier.value.trim(), url: file ? '' : url, csv: file ? await file.text() : '' };
+        renderMapping(await api('import/preview', { method: 'POST', body: state.sheet.url ? { url: state.sheet.url } : { csv: state.sheet.csv } }));
+      } catch (err) { fail(err); }
+    }
+    if (e.target.id === 'sheet-run') {
+      e.preventDefault(); const f = e.target; const btn = f.querySelector('button');
+      const mapping = Object.fromEntries(FIELDS.map(([k]) => [k, parseInt(f['map-' + k].value, 10)]));
+      btn.disabled = true; btn.textContent = 'Importing…';
+      try {
+        const { result } = await api('import/run', { method: 'POST', body: { supplier: state.sheet.supplier, ...(state.sheet.url ? { url: state.sheet.url, keepSynced: f.keepSynced?.checked } : { csv: state.sheet.csv }), mapping, options: { priceMode: f.priceMode.value, markup: f.markup.value, category: f.category.value } } });
+        toast(`${result.added} added, ${result.updated} updated, ${result.skipped} skipped`);
+        state.sheet = null; await load();
+      } catch (err) { btn.disabled = false; btn.textContent = 'Import products'; fail(err); }
+    }
     if (e.target.id === 'settings') {
       e.preventDefault(); const f = e.target;
       try {
-        await api('settings', { method: 'PUT', body: { storeName: f.storeName.value, supportEmail: f.supportEmail.value, tagline: f.tagline.value, announcement: f.announcement.value, taxRate: parseFloat(f.taxRate.value) || 0,
+        await api('settings', { method: 'PUT', body: { storeName: f.storeName.value, supportEmail: f.supportEmail.value, tagline: f.tagline.value, announcement: f.announcement.value, taxRate: parseFloat(f.taxRate.value) || 0, autoForwardCJ: f.autoForwardCJ.checked, cjPayFromBalance: f.cjPayFromBalance.checked, cjFromCountry: f.cjFromCountry.value, cjLogistic: f.cjLogistic.value,
           shipping: { domesticFlat: toCents(f.domesticFlat.value), freeOver: toCents(f.freeOver.value), internationalFlat: toCents(f.internationalFlat.value) } } });
         toast('Settings saved'); load();
       } catch (err) { fail(err); }
